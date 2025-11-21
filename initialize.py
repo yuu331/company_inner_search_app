@@ -20,6 +20,7 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
 import constants as ct
 from langchain.schema import Document
+import csv
 
 
 ############################################################
@@ -129,8 +130,23 @@ def initialize_retriever():
         separator="\n"
     )
 
-    # チャンク分割を実施
-    splitted_docs = text_splitter.split_documents(docs_all)
+    # チャンク分割を実施（CSVファイルは分割しない）
+    splitted_docs = []
+    for doc in docs_all:
+        # デバッグ：メタデータを確認
+        logger.info(f"ドキュメント処理中: file_name={doc.metadata.get('file_name')}, no_split={doc.metadata.get('no_split')}, file_type={doc.metadata.get('file_type')}")
+        
+        if doc.metadata.get("no_split") == True:
+            # CSVファイル（no_split=True）は分割せずそのまま追加
+            splitted_docs.append(doc)
+            logger.info(f"チャンク分割をスキップ: {doc.metadata.get('file_name')} (文字数: {len(doc.page_content)})")
+        else:
+            # その他のファイルは通常通り分割
+            chunks = text_splitter.split_documents([doc])
+            splitted_docs.extend(chunks)
+            logger.info(f"チャンク分割実施: {doc.metadata.get('file_name', 'unknown')} → {len(chunks)}チャンク")
+
+    logger.info(f"最終的なドキュメント数: {len(splitted_docs)}")
 
     # ベクターストアの作成
     db = Chroma.from_documents(splitted_docs, embedding=embeddings)
@@ -208,6 +224,9 @@ def file_load(path, docs_all):
         path: ファイルパス
         docs_all: データソースを格納する用のリスト
     """
+    # ロガーを取得
+    logger = logging.getLogger(ct.LOGGER_NAME)
+    
     # ファイルの拡張子を取得
     file_extension = os.path.splitext(path)[1]
     # ファイル名（拡張子を含む）を取得
@@ -215,25 +234,83 @@ def file_load(path, docs_all):
 
     # 想定していたファイル形式の場合のみ読み込む
     if file_extension in ct.SUPPORTED_EXTENSIONS:
-        # ファイルの拡張子に合ったdata loaderを使ってデータ読み込み
-        loader = ct.SUPPORTED_EXTENSIONS[file_extension](path)
-        docs = loader.load()
-
-        # csvの場合、1つのドキュメントにマージしてからリストに追加
+        # csvの場合、検索精度を上げる形式で1つのドキュメントに統合
         if file_extension == ".csv":
-            if not docs:
+            logger.info(f"CSVファイル読み込み開始: {path}")
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    csv_reader = csv.DictReader(f)
+                    headers = csv_reader.fieldnames
+                    
+                    logger.debug(f"CSVヘッダー: {headers}")
+                    
+                    # 一旦データを読み込んで行数をカウント
+                    rows = list(csv_reader)
+                    
+                    logger.info(f"CSV行数: {len(rows)}行")
+                    
+                    # 各カラムの全ユニーク値を抽出（検索キーワードとして冒頭に配置）
+                    column_values = {}
+                    for header in headers:
+                        unique_values = set()
+                        for row in rows:
+                            value = row.get(header, '')
+                            if value and value != 'N/A':
+                                unique_values.add(value)
+                        column_values[header] = sorted(unique_values)
+                    
+                    # ドキュメント作成（検索精度向上のため、キーワードを冒頭に配置）
+                    merged_text = f"===== {file_name} - データ概要 =====\n"
+                    merged_text += f"総レコード数: {len(rows)}件\n\n"
+                    
+                    # 各カラムの値を列挙（検索キーワードとして機能）
+                    merged_text += "【データ項目と値の一覧】\n"
+                    for header in headers:
+                        values = column_values.get(header, [])
+                        if len(values) <= 50:  # 値が多すぎる場合は省略
+                            merged_text += f"{header}: {', '.join(map(str, values))}\n"
+                        else:
+                            merged_text += f"{header}: {len(values)}種類の値\n"
+                    merged_text += "\n"
+                    
+                    # 全レコードを詳細に記載（1行形式）
+                    merged_text += "===== 全レコードデータ =====\n"
+                    for idx, row in enumerate(rows, start=1):
+                        # 1行にまとめて記載（検索時に全情報が近くにある方が有利）
+                        record_parts = [f"{header}={row.get(header, '')}" for header in headers]
+                        merged_text += f"[{idx}] {' | '.join(record_parts)}\n"
+                    
+                    # メタデータ
+                    metadata = {
+                        "source": path,
+                        "file_name": file_name,
+                        "file_type": "csv",
+                        "total_rows": len(rows),
+                        "columns": ", ".join(headers),
+                        "no_split": True  # ←チャンク分割禁止フラグ
+                    }
+                    
+                    merged_doc = Document(page_content=merged_text, metadata=metadata)
+                    docs_all.append(merged_doc)
+                    
+                    # 読み込み成功のログ出力
+                    logger.info(f"CSVファイル読み込み成功: {path} (レコード数: {len(rows)})")
+                    logger.info(f"作成されたドキュメントの文字数: {len(merged_text)}")
+                    logger.info(f"ドキュメント冒頭100文字: {merged_text[:100]}")
+                
+            except Exception as e:
+                logger.error(f"CSVファイルの読み込みエラー: {path}, エラー: {e}", exc_info=True)
                 return
-            merged_text = "\n\n".join(d.page_content for d in docs)
-            metadata = {
-                "source": path,
-                "file_name": file_name,
-                "merged_rows": len(docs)
-            }
-            merged_doc = Document(page_content=merged_text, metadata=metadata)
-            docs_all.append(merged_doc)
         else:
-            # csv以外の場合、読み込んだデータソースをそのままリストに追加
-            docs_all.extend(docs)
+            # csv以外の場合、元のloaderを使用
+            logger.info(f"ファイル読み込み開始: {path} (タイプ: {file_extension})")
+            try:
+                loader = ct.SUPPORTED_EXTENSIONS[file_extension](path)
+                docs = loader.load()
+                docs_all.extend(docs)
+                logger.info(f"ファイル読み込み成功: {path} (ドキュメント数: {len(docs)})")
+            except Exception as e:
+                logger.error(f"ファイル読み込みエラー: {path}, エラー: {e}", exc_info=True)
 
 
 def adjust_string(s):
