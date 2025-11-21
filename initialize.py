@@ -19,6 +19,7 @@ from langchain.text_splitter import CharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
 import constants as ct
+from langchain.schema import Document
 
 
 ############################################################
@@ -217,7 +218,22 @@ def file_load(path, docs_all):
         # ファイルの拡張子に合ったdata loaderを使ってデータ読み込み
         loader = ct.SUPPORTED_EXTENSIONS[file_extension](path)
         docs = loader.load()
-        docs_all.extend(docs)
+
+        # csvの場合、1つのドキュメントにマージしてからリストに追加
+        if file_extension == ".csv":
+            if not docs:
+                return
+            merged_text = "\n\n".join(d.page_content for d in docs)
+            metadata = {
+                "source": path,
+                "file_name": file_name,
+                "merged_rows": len(docs)
+            }
+            merged_doc = Document(page_content=merged_text, metadata=metadata)
+            docs_all.append(merged_doc)
+        else:
+            # csv以外の場合、読み込んだデータソースをそのままリストに追加
+            docs_all.extend(docs)
 
 
 def adjust_string(s):
